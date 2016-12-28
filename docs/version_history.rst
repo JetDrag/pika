@@ -7,6 +7,49 @@ Next Release
  - Connection failures that occur after the socket is opened and before the
    AMQP connection is ready to go are now reported by calling the connection
    error callback.  Previously these were not consistently reported.
+ - In BaseConnection.close, call _handle_ioloop_stop only if the connection is
+   already closed to allow the asynchronous close operation to complete
+   gracefully.
+ - Pass error information from failed socket connection to user callbacks
+   on_open_error_callback and on_close_callback with result_code=-1.
+ - ValueError is raised when a completion callback is passed to an asynchronous
+   (nowait) Channel operation. It's an application error to pass a non-None
+   completion callback with an asynchronous request, because this callback can
+   never be serviced in the asynchronous scenario.
+ - `Channel.basic_reject` fixed to allow `delivery_tag` to be of type `long`
+   as well as `int`. (by quantum5)
+ - Implemented support for blocked connection timeouts in
+   `pika.connection.Connection`. This feature is available to all pika adapters.
+   See `pika.connection.ConnectionParameters` docstring to learn more about
+   `blocked_connection_timeout` configuration.
+ - Deprecated the `heartbeat_interval` arg in `pika.ConnectionParameters` in
+   favor of the `heartbeat` arg for consistency with the other connection
+   parameters classes `pika.connection.Parameters` and `pika.URLParameters`.
+ - When the `port` arg is not set explicitly in `ConnectionParameters`
+   constructor, but the `ssl` arg is set explicitly, then set the port value to
+   to the default AMQP SSL port if SSL is enabled, otherwise to the default
+   AMQP plaintext port.
+ - `URLParameters` will raise ValueError if a non-empty URL scheme other than
+   {amqp | amqps | http | https} is specified.
+ - `InvalidMinimumFrameSize` and `InvalidMaximumFrameSize` exceptions are
+   deprecated. pika.connection.Parameters.frame_max property setter now raises
+   the standard `ValueError` exception when the value is out of bounds.
+ - Removed deprecated parameter `type` in `Channel.exchange_declare` and
+   `BlockingChannel.exchnage_declare` in favor of the `exchange_type` arg that
+   doesn't overshadow the builtin `type` keyword.
+ - Channel.close() on OPENING channel transitions it to CLOSING instead of
+   raising ChannelClosed.
+ - Channel.close() on CLOSING channel raises `ChannelAlreadyClosing`; used to
+   raise `ChannelClosed`.
+ - Connection.channel() raises `ConnectionClosed` if connection is not in OPEN
+   state.
+ - When performing graceful close on a channel and `Channel.Close` from broker
+   arrives while waiting for CloseOk, don't release the channel number until
+   CloseOk arrives to avoid race condition that may lead to a new channel
+   receiving the CloseOk that was destined for the closing channel.
+ - The `backpressure_detection` option of `ConnectionParameters` and
+   `URLParameters` property is DEPRECATED in favor of `Connection.Blocked` and
+   `Connection.Unblocked`. See `Connection.add_on_connection_blocked_callback`.
 
 0.10.0 2015-09-02
 -----------------

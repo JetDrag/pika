@@ -11,6 +11,7 @@ except ImportError:
 import uuid
 
 from forward_server import ForwardServer
+from test_utils import retry_assertion
 
 import pika
 from pika.adapters import blocking_connection
@@ -33,7 +34,9 @@ import pika.exceptions
 # Disable warning Invalid variable name
 # pylint: disable=C0103
 
+
 LOGGER = logging.getLogger(__name__)
+
 PARAMS_URL_TEMPLATE = (
     'amqp://guest:guest@127.0.0.1:%(port)s/%%2f?socket_timeout=1')
 DEFAULT_URL = PARAMS_URL_TEMPLATE % {'port': 5672}
@@ -70,6 +73,14 @@ class BlockingTestCaseBase(unittest.TestCase):
         LOGGER.info('%s TIMED OUT (%s)', datetime.utcnow(), self)
         self.fail('Test timed out')
 
+    @retry_assertion(TIMEOUT/2)
+    def _assert_exact_message_count_with_retries(self,
+                                                 channel,
+                                                 queue,
+                                                 expected_count):
+        frame = channel.queue_declare(queue, passive=True)
+        self.assertEqual(frame.method.message_count, expected_count)
+
 
 class TestCreateAndCloseConnection(BlockingTestCaseBase):
 
@@ -85,6 +96,25 @@ class TestCreateAndCloseConnection(BlockingTestCaseBase):
         self.assertTrue(connection.is_closed)
         self.assertFalse(connection.is_open)
         self.assertFalse(connection.is_closing)
+
+
+class TestMultiCloseConnection(BlockingTestCaseBase):
+
+    def test(self):
+        """BlockingConnection: Close connection twice"""
+        connection = self._connect()
+        self.assertIsInstance(connection, pika.BlockingConnection)
+        self.assertTrue(connection.is_open)
+        self.assertFalse(connection.is_closed)
+        self.assertFalse(connection.is_closing)
+
+        connection.close()
+        self.assertTrue(connection.is_closed)
+        self.assertFalse(connection.is_open)
+        self.assertFalse(connection.is_closing)
+
+        # Second close call shouldn't crash
+        connection.close()
 
 
 class TestConnectionContextManagerClosesConnection(BlockingTestCaseBase):
@@ -346,7 +376,7 @@ class TestProcessDataEvents(BlockingTestCaseBase):
         self.assertLess(elapsed, 0.25)
 
 
-class TestConnectionBlockAndUnblock(BlockingTestCaseBase):
+class TestConnectionRegisterForBlockAndUnblock(BlockingTestCaseBase):
 
     def test(self):
         """BlockingConnection register for Connection.Blocked/Unblocked"""
@@ -375,6 +405,35 @@ class TestConnectionBlockAndUnblock(BlockingTestCaseBase):
         repr(evt)
         evt.dispatch()
         self.assertEqual(unblocked_buffer, ["unblocked"])
+
+
+class TestBlockedConnectionTimeout(BlockingTestCaseBase):
+
+    def test(self):
+        """BlockingConnection Connection.Blocked timeout """
+        url = DEFAULT_URL + '&blocked_connection_timeout=0.001'
+        conn = self._connect(url=url)
+
+        # NOTE: I haven't figured out yet how to coerce RabbitMQ to emit
+        # Connection.Block and Connection.Unblock from the test, so we'll
+        # simulate it for now
+
+        # Simulate Connection.Blocked
+        conn._impl._on_connection_blocked(pika.frame.Method(
+            0,
+            pika.spec.Connection.Blocked('TestBlockedConnectionTimeout')))
+
+        # Wait for connection teardown
+        with self.assertRaises(pika.exceptions.ConnectionClosed) as excCtx:
+            while True:
+                conn.process_data_events(time_limit=1)
+
+        self.assertEqual(
+            excCtx.exception.args,
+            (pika.connection.InternalCloseReasons.BLOCKED_CONNECTION_TIMEOUT,
+             'Blocked connection timeout expired'))
+
+
 
 
 class TestAddTimeoutRemoveTimeout(BlockingTestCaseBase):
@@ -434,7 +493,7 @@ class TestRemoveTimeoutFromTimeoutCallback(BlockingTestCaseBase):
         while not rx_timer2:
             connection.process_data_events(time_limit=None)
 
-        self.assertNotIn(timer_id1, connection._impl.ioloop._timeouts)
+        self.assertNotIn(timer_id1, connection._impl.ioloop._poller._timeouts)
         self.assertFalse(connection._ready_events)
 
 
@@ -576,8 +635,9 @@ class TestExchangeBindAndUnbind(BlockingTestCaseBase):
                    mandatory=True)
 
         # Check that the queue now has one message
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 1)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=1)
 
         # Unbind the exchanges
         frame = ch.exchange_unbind(destination=dest_exg_name,
@@ -759,10 +819,9 @@ class TestBasicGet(BlockingTestCaseBase):
         LOGGER.info('%s ACKED (%s)', datetime.utcnow(), self)
 
         # Verify that the queue is now empty
-        frame = ch.queue_declare(q_name, passive=True)
-        LOGGER.info('%s DECLARE PASSIVE QUEUE DONE (%s)',
-                    datetime.utcnow(), self)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
 
 class TestBasicReject(BlockingTestCaseBase):
@@ -804,8 +863,9 @@ class TestBasicReject(BlockingTestCaseBase):
 
         # Verify that exactly one message is present in the queue, namely the
         # second one
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 1)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=1)
         (rx_method, _, rx_body) = ch.basic_get(q_name, no_ack=False)
         self.assertEqual(rx_body, as_bytes('TestBasicReject2'))
 
@@ -850,8 +910,9 @@ class TestBasicRejectNoRequeue(BlockingTestCaseBase):
         ch.basic_reject(rx_method.delivery_tag, requeue=False)
 
         # Verify that no messages are present in the queue
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
 
 class TestBasicNack(BlockingTestCaseBase):
@@ -893,8 +954,9 @@ class TestBasicNack(BlockingTestCaseBase):
 
         # Verify that exactly one message is present in the queue, namely the
         # second one
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 1)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=1)
         (rx_method, _, rx_body) = ch.basic_get(q_name, no_ack=False)
         self.assertEqual(rx_body, as_bytes('TestBasicNack2'))
 
@@ -939,8 +1001,9 @@ class TestBasicNackNoRequeue(BlockingTestCaseBase):
         ch.basic_nack(rx_method.delivery_tag, requeue=False)
 
         # Verify that no messages are present in the queue
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
 
 class TestBasicNackMultiple(BlockingTestCaseBase):
@@ -983,8 +1046,9 @@ class TestBasicNackMultiple(BlockingTestCaseBase):
         ch.basic_nack(rx_method.delivery_tag, multiple=True, requeue=True)
 
         # Verify that both messages are present in the queue
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 2)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=2)
         (rx_method, _, rx_body) = ch.basic_get(q_name, no_ack=False)
         self.assertEqual(rx_body,
                          as_bytes('TestBasicNackMultiple1'))
@@ -1402,11 +1466,9 @@ class TestBasicPublishDeliveredWhenPendingUnroutable(BlockingTestCaseBase):
         self.assertEqual(res, True)
 
         # Wait for the queue to get the routable message
-        while ch.queue_declare(q_name, passive=True).method.message_count < 1:
-            pass
-
-        self.assertEqual(
-            ch.queue_declare(q_name, passive=True).method.message_count, 1)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=1)
 
         msg = ch.basic_get(q_name)
 
@@ -1429,8 +1491,9 @@ class TestBasicPublishDeliveredWhenPendingUnroutable(BlockingTestCaseBase):
         ch.basic_ack(delivery_tag=rx_method.delivery_tag, multiple=False)
 
         # Verify that the queue is now empty
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
 
 class TestPublishAndConsumeWithPubacksAndQosOfOne(BlockingTestCaseBase):
@@ -1548,8 +1611,9 @@ class TestPublishAndConsumeWithPubacksAndQosOfOne(BlockingTestCaseBase):
         ch.basic_ack(delivery_tag=rx_method.delivery_tag, multiple=False)
 
         # Verify that the queue is now empty
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
         # Attempt to cosume again with a short timeout
         connection.process_data_events(time_limit=0.005)
@@ -1759,12 +1823,13 @@ class TestBasicPublishWithoutPubacks(BlockingTestCaseBase):
         # Deposit a message in the queue via basic_publish and mandatory=False
         res = ch.basic_publish(exg_name, routing_key=routing_key,
                                body='via-basic_publish_mandatory=False',
-                               mandatory=True)
+                               mandatory=False)
         self.assertEqual(res, True)
 
         # Wait for the messages to arrive in queue
-        while ch.queue_declare(q_name, passive=True).method.message_count != 2:
-            pass
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=2)
 
         # Create a consumer
         rx_messages = []
@@ -1830,8 +1895,9 @@ class TestBasicPublishWithoutPubacks(BlockingTestCaseBase):
         ch.basic_ack(delivery_tag=rx_method.delivery_tag, multiple=False)
 
         # Verify that the queue is now empty
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
         # Attempt to cosume again with a short timeout
         connection.process_data_events(time_limit=0.005)
@@ -2097,8 +2163,9 @@ class TestNonPubAckPublishAndConsumeHugeMessage(BlockingTestCaseBase):
         # Verify that the queue is now empty
         ch.close()
         ch = connection.channel()
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
 
 class TestNonPubackPublishAndConsumeManyMessages(BlockingTestCaseBase):
@@ -2154,8 +2221,9 @@ class TestNonPubackPublishAndConsumeManyMessages(BlockingTestCaseBase):
 
         # Verify that the queue is now empty
         ch = connection.channel()
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 0)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
 
 class TestBasicCancelWithNonAckableConsumer(BlockingTestCaseBase):
@@ -2181,16 +2249,18 @@ class TestBasicCancelWithNonAckableConsumer(BlockingTestCaseBase):
         ch.publish(exchange='', routing_key=q_name, body=body2)
 
         # Wait for queue to contain both messages
-        while ch.queue_declare(q_name, passive=True).method.message_count != 2:
-            pass
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=2)
 
         # Create a non-ackable consumer
         consumer_tag = ch.basic_consume(lambda *x: None, q_name, no_ack=True,
                                         exclusive=False, arguments=None)
 
         # Wait for all messages to be sent by broker to client
-        while ch.queue_declare(q_name, passive=True).method.message_count > 0:
-            pass
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
         # Cancel the consumer
         messages = ch.basic_cancel(consumer_tag)
@@ -2208,7 +2278,7 @@ class TestBasicCancelWithNonAckableConsumer(BlockingTestCaseBase):
 
         ch = connection.channel()
 
-        # Verify that the queue is now empty; this validates the multi-ack
+        # Verify that the queue is now empty
         frame = ch.queue_declare(q_name, passive=True)
         self.assertEqual(frame.method.message_count, 0)
 
@@ -2236,16 +2306,18 @@ class TestBasicCancelWithAckableConsumer(BlockingTestCaseBase):
         ch.publish(exchange='', routing_key=q_name, body=body2)
 
         # Wait for queue to contain both messages
-        while ch.queue_declare(q_name, passive=True).method.message_count != 2:
-            pass
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=2)
 
         # Create an ackable consumer
         consumer_tag = ch.basic_consume(lambda *x: None, q_name, no_ack=False,
                                         exclusive=False, arguments=None)
 
         # Wait for all messages to be sent by broker to client
-        while ch.queue_declare(q_name, passive=True).method.message_count > 0:
-            pass
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=0)
 
         # Cancel the consumer
         messages = ch.basic_cancel(consumer_tag)
@@ -2257,9 +2329,10 @@ class TestBasicCancelWithAckableConsumer(BlockingTestCaseBase):
 
         ch = connection.channel()
 
-        # Verify that the queue is now empty; this validates the multi-ack
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 2)
+        # Verify that canceling the ackable consumer restored both messages
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=2)
 
 
 class TestUnackedMessageAutoRestoredToQueueOnChannelClose(BlockingTestCaseBase):
@@ -2307,8 +2380,9 @@ class TestUnackedMessageAutoRestoredToQueueOnChannelClose(BlockingTestCaseBase):
         # Verify that there are two messages in q now
         ch = connection.channel()
 
-        frame = ch.queue_declare(q_name, passive=True)
-        self.assertEqual(frame.method.message_count, 2)
+        self._assert_exact_message_count_with_retries(channel=ch,
+                                                      queue=q_name,
+                                                      expected_count=2)
 
 
 class TestNoAckMessageNotRestoredToQueueOnChannelClose(BlockingTestCaseBase):
